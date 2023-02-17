@@ -53,18 +53,18 @@ def test_to_camel_case(input: str, output: str):
         ("", ""),
         ("hello", "Hello"),
         ("Hello", "Hello"),
-        ("snake_case", "Snake Case"),
-        ("snake_case_two", "Snake Case Two"),
+        ("snake_case", "SnakeCase"),
+        ("snake_case_two", "SnakeCaseTwo"),
     ],
 )
-def test_to_title(input: str, output: str):
+def test_to_title_case(input: str, output: str):
     """Test converting strings to title case.
 
     Args:
         input: The input string.
         output: The expected output string.
     """
-    assert utils.to_title(input) == output
+    assert utils.to_title_case(input) == output
 
 
 @pytest.mark.parametrize(
@@ -145,15 +145,18 @@ def test_wrap(text: str, open: str, expected: str, check_first: bool, num: int):
         ("  hello\n  world", 2, "    hello\n    world\n"),
     ],
 )
-def test_indent(text: str, indent_level: int, expected: str):
+def test_indent(text: str, indent_level: int, expected: str, windows_platform: bool):
     """Test indenting a string.
 
     Args:
         text: The text to indent.
         indent_level: The number of spaces to indent by.
         expected: The expected output string.
+        windows_platform: Whether the system is windows.
     """
-    assert utils.indent(text, indent_level) == expected
+    assert utils.indent(text, indent_level) == (
+        expected.replace("\n", "\r\n") if windows_platform else expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -204,3 +207,57 @@ def test_is_generic_alias(cls: type, expected: bool):
         expected: Whether the class is a GenericAlias.
     """
     assert utils.is_generic_alias(cls) == expected
+
+
+@pytest.mark.parametrize(
+    "route,expected",
+    [
+        ("", "index"),
+        ("/", "index"),
+        ("custom-route", "custom-route"),
+        ("custom-route/", "custom-route"),
+        ("/custom-route", "custom-route"),
+    ],
+)
+def test_format_route(route: str, expected: bool):
+    """Test formatting a route.
+
+    Args:
+        route: The route to format.
+        expected: The expected formatted route.
+    """
+    assert utils.format_route(route) == expected
+
+
+def test_setup_frontend(tmp_path, mocker):
+    """Test checking if assets content have been
+    copied into the .web/public folder.
+
+    Args:
+        tmp_path: root path of test case data directory
+        mocker: mocker object to allow mocking
+    """
+    web_folder = tmp_path / ".web"
+    web_public_folder = web_folder / "public"
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "favicon.ico").touch()
+
+    mocker.patch("pynecone.utils.install_frontend_packages")
+
+    utils.setup_frontend(tmp_path)
+    assert web_folder.exists()
+    assert web_public_folder.exists()
+    assert (web_public_folder / "favicon.ico").exists()
+
+
+@pytest.mark.parametrize(
+    "input, output",
+    [
+        ("_hidden", True),
+        ("not_hidden", False),
+        ("__dundermethod__", False),
+    ],
+)
+def test_is_backend_variable(input, output):
+    assert utils.is_backend_variable(input) == output

@@ -2,7 +2,9 @@
 
 from typing import Set
 
+from pynecone.components.component import Component
 from pynecone.components.libs.chakra import ChakraComponent
+from pynecone.components.media.icon import Icon
 from pynecone.var import Var
 
 
@@ -51,7 +53,7 @@ class Drawer(ChakraComponent):
     size: Var[str]
 
     # A11y: If true, the siblings of the modal will have `aria-hidden` set to true so that screen readers can only see the modal. This is commonly known as making the other elements **inert**
-    use_intert: Var[bool]
+    use_inert: Var[bool]
 
     # Variant of drawer
     variant: Var[str]
@@ -69,6 +71,56 @@ class Drawer(ChakraComponent):
             "on_esc",
             "on_overlay_click",
         }
+
+    @classmethod
+    def create(
+        cls, *children, header=None, body=None, footer=None, close_button=None, **props
+    ) -> Component:
+        """Create a drawer component.
+
+        Args:
+            children: The children of the drawer component.
+            header: The header of the drawer.
+            body: The body of the drawer.
+            footer: The footer of the drawer.
+            close_button: The close button of the drawer.
+            props: The properties of the drawer component.
+
+        Raises:
+            AttributeError: error that occurs if conflicting props are passed
+
+        Returns:
+            The drawer component.
+        """
+        if len(children) == 0:
+            contents = []
+
+            if header:
+                contents.append(DrawerHeader.create(header))
+
+            if body:
+                contents.append(DrawerBody.create(body))
+
+            if footer:
+                contents.append(DrawerFooter.create(footer))
+
+            if props.get("on_close"):
+                # use default close button if undefined
+                if not close_button:
+                    close_button = Icon.create(tag="CloseIcon")
+                contents.append(DrawerCloseButton.create(close_button))
+            elif close_button:
+                raise AttributeError(
+                    "Close button can not be used if on_close event handler is not defined"
+                )
+
+            children = [
+                DrawerOverlay.create(
+                    DrawerContent.create(*contents),
+                )
+            ]
+
+        return super().create(*children, **props)
 
 
 class DrawerBody(ChakraComponent):
@@ -89,19 +141,19 @@ class DrawerFooter(ChakraComponent):
     tag = "DrawerFooter"
 
 
-class DrawerOverlay(Drawer):
+class DrawerOverlay(ChakraComponent):
     """Drawer overlay."""
 
     tag = "DrawerOverlay"
 
 
-class DrawerContent(Drawer):
+class DrawerContent(ChakraComponent):
     """Drawer content."""
 
     tag = "DrawerContent"
 
 
-class DrawerCloseButton(Drawer):
+class DrawerCloseButton(ChakraComponent):
     """Drawer close button."""
 
     tag = "DrawerCloseButton"

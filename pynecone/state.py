@@ -3,15 +3,28 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import pickle
 import traceback
 from abc import ABC
-from typing import Any, Callable, ClassVar, Dict, List, Optional, Sequence, Set, Type
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Type,
+    Union,
+)
+
+import cloudpickle
+from redis import Redis
 
 from pynecone import constants, utils
 from pynecone.base import Base
 from pynecone.event import Event, EventHandler, window_alert
-from pynecone.var import BaseVar, ComputedVar, Var
+from pynecone.var import BaseVar, ComputedVar, PCDict, PCList, Var
 
 Delta = Dict[str, Any]
 
@@ -28,8 +41,11 @@ class State(Base, ABC):
     # The computed vars of the class.
     computed_vars: ClassVar[Dict[str, ComputedVar]] = {}
 
-    # vars inherited by the parent state.
+    # Vars inherited by the parent state.
     inherited_vars: ClassVar[Dict[str, Var]] = {}
+
+    # Backend vars that are never sent to the client.
+    backend_vars: ClassVar[Dict[str, Any]] = {}
 
     # The parent state.
     parent_state: Optional[State] = None
@@ -43,6 +59,9 @@ class State(Base, ABC):
     # The set of dirty substates.
     dirty_substates: Set[str] = set()
 
+    # The routing path that triggered the state
+    router_data: Dict[str, Any] = {}
+
     def __init__(self, *args, **kwargs):
         """Initialize the state.
 
@@ -55,6 +74,40 @@ class State(Base, ABC):
         # Setup the substates.
         for substate in self.get_substates():
             self.substates[substate.get_name()] = substate().set(parent_state=self)
+
+        self._init_mutable_fields()
+
+    def _init_mutable_fields(self):
+        """Initialize mutable fields.
+
+        So that mutation to them can be detected by the app:
+        * list
+        """
+        for field in self.base_vars.values():
+            value = getattr(self, field.name)
+
+            value_in_pc_data = _convert_mutable_datatypes(
+                value, self._reassign_field, field.name
+            )
+
+            if utils._issubclass(field.type_, Union[List, Dict]):
+                setattr(self, field.name, value_in_pc_data)
+
+        self.clean()
+
+    def _reassign_field(self, field_name: str):
+        """Reassign the given field.
+
+        Primarily for mutation in fields of mutable data types.
+
+        Args:
+            field_name: The name of the field we want to reassign
+        """
+        setattr(
+            self,
+            field_name,
+            getattr(self, field_name),
+        )
 
     def __repr__(self) -> str:
         """Get the string representation of the state.
@@ -70,9 +123,6 @@ class State(Base, ABC):
 
         Args:
             **kwargs: The kwargs to pass to the pydantic init_subclass method.
-
-        Raises:
-            TypeError: If the class has a var with an invalid type.
         """
         super().__init_subclass__(**kwargs)
 
@@ -81,12 +131,19 @@ class State(Base, ABC):
         if parent_state is not None:
             cls.inherited_vars = parent_state.vars
 
+        cls.backend_vars = {
+            name: value
+            for name, value in cls.__dict__.items()
+            if utils.is_backend_variable(name)
+        }
+
         # Set the base and computed vars.
         skip_vars = set(cls.inherited_vars) | {
             "parent_state",
             "substates",
             "dirty_vars",
             "dirty_substates",
+            "router_data",
         }
         cls.base_vars = {
             f.name: BaseVar(name=f.name, type_=f.outer_type_).set_state(cls)
@@ -106,16 +163,7 @@ class State(Base, ABC):
 
         # Setup the base vars at the class level.
         for prop in cls.base_vars.values():
-            if not utils._issubclass(prop.type_, utils.StateVar):
-                raise TypeError(
-                    "State vars must be primitive Python types, "
-                    "Plotly figures, Pandas dataframes, "
-                    "or subclasses of pc.Base. "
-                    f'Found var "{prop.name}" with type {prop.type_}.'
-                )
-            cls._set_var(prop)
-            cls._create_setter(prop)
-            cls._set_default_value(prop)
+            cls._init_var(prop)
 
         # Set up the event handlers.
         events = {
@@ -151,7 +199,7 @@ class State(Base, ABC):
         Returns:
             The substates of the state.
         """
-        return {subclass for subclass in cls.__subclasses__()}
+        return set(cls.__subclasses__())
 
     @classmethod
     @functools.lru_cache()
@@ -222,6 +270,60 @@ class State(Base, ABC):
         return getattr(substate, name)
 
     @classmethod
+    def _init_var(cls, prop: BaseVar):
+        """Initialize a variable.
+
+        Args:
+            prop (BaseVar): The variable to initialize
+
+        Raises:
+            TypeError: if the variable has an incorrect type
+        """
+        if not utils.is_valid_var_type(prop.type_):
+            raise TypeError(
+                "State vars must be primitive Python types, "
+                "Plotly figures, Pandas dataframes, "
+                "or subclasses of pc.Base. "
+                f'Found var "{prop.name}" with type {prop.type_}.'
+            )
+        cls._set_var(prop)
+        cls._create_setter(prop)
+        cls._set_default_value(prop)
+
+    @classmethod
+    def add_var(cls, name: str, type_: Any, default_value: Any = None):
+        """Add dynamically a variable to the State.
+
+        The variable added this way can be used in the same way as a variable
+        defined statically in the model.
+
+        Args:
+            name: The name of the variable
+            type_: The type of the variable
+            default_value: The default value of the variable
+
+        Raises:
+            NameError: if a variable of this name already exists
+        """
+        if name in cls.__fields__:
+            raise NameError(
+                f"The variable '{name}' already exist. Use a different name"
+            )
+
+        # create the variable based on name and type
+        var = BaseVar(name=name, type_=type_)
+        var.set_state(cls)
+
+        # add the pydantic field dynamically (must be done before _init_var)
+        cls.add_field(var, default_value)
+
+        cls._init_var(var)
+
+        # update the internal dicts so the new variable is correctly handled
+        cls.base_vars.update({name: var})
+        cls.vars.update({name: var})
+
+    @classmethod
     def _set_var(cls, prop: BaseVar):
         """Set the var as a class member.
 
@@ -255,38 +357,123 @@ class State(Base, ABC):
             field.required = False
             field.default = default_value
 
-    def __getattribute__(self, name: str) -> Any:
-        """Get the attribute.
-
-        Args:
-            name: The name of the attribute.
+    def get_token(self) -> str:
+        """Return the token of the client associated with this state.
 
         Returns:
-            The attribute.
-
-        Raises:
-            Exception: If the attribute is not found.
+            The token of the client.
         """
-        # If it is an inherited var, return from the parent state.
-        if name != "inherited_vars" and name in self.inherited_vars:
-            return getattr(self.parent_state, name)
-        try:
-            return super().__getattribute__(name)
-        except Exception as e:
-            # Check if the attribute is a substate.
-            if name in self.substates:
-                return self.substates[name]
-            raise e
+        return self.router_data.get(constants.RouteVar.CLIENT_TOKEN, "")
+
+    def get_sid(self) -> str:
+        """Return the session ID of the client associated with this state.
+
+        Returns:
+            The session ID of the client.
+        """
+        return self.router_data.get(constants.RouteVar.SESSION_ID, "")
+
+    def get_headers(self) -> Dict:
+        """Return the headers of the client associated with this state.
+
+        Returns:
+            The headers of the client.
+        """
+        return self.router_data.get(constants.RouteVar.HEADERS, {})
+
+    def get_client_ip(self) -> str:
+        """Return the IP of the client associated with this state.
+
+        Returns:
+            The IP of the client.
+        """
+        return self.router_data.get(constants.RouteVar.CLIENT_IP, "")
+
+    def get_current_page(self) -> str:
+        """Obtain the path of current page from the router data.
+
+        Returns:
+            The current page.
+        """
+        return self.router_data.get(constants.RouteVar.PATH, "")
+
+    def get_query_params(self) -> Dict[str, str]:
+        """Obtain the query parameters for the queried page.
+
+        The query object contains both the URI parameters and the GET parameters.
+
+        Returns:
+            The dict of query parameters.
+        """
+        return self.router_data.get(constants.RouteVar.QUERY, {})
+
+    @classmethod
+    def setup_dynamic_args(cls, args: dict[str, str]):
+        """Set up args for easy access in renderer.
+
+        Args:
+            args: a dict of args
+        """
+
+        def argsingle_factory(param):
+            @ComputedVar
+            def inner_func(self) -> str:
+                return self.get_query_params().get(param, "")
+
+            return inner_func
+
+        def arglist_factory(param):
+            @ComputedVar
+            def inner_func(self) -> List:
+                return self.get_query_params().get(param, [])
+
+            return inner_func
+
+        for param, value in args.items():
+            if value == constants.RouteArgType.SINGLE:
+                func = argsingle_factory(param)
+            elif value == constants.RouteArgType.LIST:
+                func = arglist_factory(param)
+            else:
+                continue
+            cls.computed_vars[param] = func.set_state(cls)  # type: ignore
+            setattr(cls, param, func)
+
+    def __getattribute__(self, name: str) -> Any:
+        """Get the state var.
+
+        If the var is inherited, get the var from the parent state.
+
+        Args:
+            name: The name of the var.
+
+        Returns:
+            The value of the var.
+        """
+        # Get the var from the parent state.
+        if name in super().__getattribute__("inherited_vars"):
+            return getattr(super().__getattribute__("parent_state"), name)
+        elif name in super().__getattribute__("backend_vars"):
+            return super().__getattribute__("backend_vars").__getitem__(name)
+        return super().__getattribute__(name)
 
     def __setattr__(self, name: str, value: Any):
         """Set the attribute.
+
+        If the attribute is inherited, set the attribute on the parent state.
 
         Args:
             name: The name of the attribute.
             value: The value of the attribute.
         """
-        if name != "inherited_vars" and name in self.inherited_vars:
+        # Set the var on the parent state.
+        if name in self.inherited_vars:
             setattr(self.parent_state, name, value)
+            return
+
+        if utils.is_backend_variable(name):
+            self.backend_vars.__setitem__(name, value)
+            self.mark_dirty()
             return
 
         # Set the attribute.
@@ -355,10 +542,12 @@ class State(Base, ABC):
                 events = await fn(**event.payload)
             else:
                 events = fn(**event.payload)
-        except:
+        except Exception:
             error = traceback.format_exc()
             print(error)
-            return StateUpdate(events=[window_alert(error)])
+            return StateUpdate(
+                events=[window_alert("An error occurred. See logs for details.")]
+            )
 
         # Fix the returned events.
         events = utils.fix_events(events, event.token)
@@ -383,14 +572,15 @@ class State(Base, ABC):
         # Return the dirty vars, as well as all computed vars.
         subdelta = {
             prop: getattr(self, prop)
-            for prop in self.dirty_vars | set(self.computed_vars.keys())
+            for prop in self.dirty_vars | self.computed_vars.keys()
         }
         if len(subdelta) > 0:
             delta[self.get_full_name()] = subdelta
 
         # Recursively find the substate deltas.
+        substates = self.substates
         for substate in self.dirty_substates:
-            delta.update(self.substates[substate].get_delta())
+            delta.update(substates[substate].get_delta())
 
         # Format the delta.
         delta = utils.format_state(delta)
@@ -441,8 +631,8 @@ class State(Base, ABC):
             k: v.dict(include_computed=include_computed, **kwargs)
             for k, v in self.substates.items()
         }
-        vars = {**base_vars, **computed_vars, **substate_vars}
-        return {k: vars[k] for k in sorted(vars)}
+        variables = {**base_vars, **computed_vars, **substate_vars}
+        return {k: variables[k] for k in sorted(variables)}
 
 
 class DefaultState(State):
@@ -474,7 +664,7 @@ class StateManager(Base):
     token_expiration: int = constants.TOKEN_EXPIRATION
 
     # The redis client to use.
-    redis: Any = None
+    redis: Optional[Redis] = None
 
     def setup(self, state: Type[State]):
         """Set up the state manager.
@@ -499,7 +689,7 @@ class StateManager(Base):
             if redis_state is None:
                 self.set_state(token, self.state())
                 return self.get_state(token)
-            return pickle.loads(redis_state)
+            return cloudpickle.loads(redis_state)
 
         if token not in self.states:
             self.states[token] = self.state()
@@ -514,4 +704,41 @@ class StateManager(Base):
         """
         if self.redis is None:
             return
-        self.redis.set(token, pickle.dumps(state), ex=self.token_expiration)
+        self.redis.set(token, cloudpickle.dumps(state), ex=self.token_expiration)
+
+
+def _convert_mutable_datatypes(
+    field_value: Any, reassign_field: Callable, field_name: str
+) -> Any:
+    """Recursively convert mutable data to the Pc data types.
+
+    Note: right now only list & dict would be handled recursively.
+
+    Args:
+        field_value: The target field_value.
+        reassign_field:
+            The function to reassign the field in the parent state.
+        field_name: the name of the field in the parent state
+
+    Returns:
+        The converted field_value
+    """
+    if isinstance(field_value, list):
+        for index in range(len(field_value)):
+            field_value[index] = _convert_mutable_datatypes(
+                field_value[index], reassign_field, field_name
+            )
+
+        field_value = PCList(
+            field_value, reassign_field=reassign_field, field_name=field_name
+        )
+
+    if isinstance(field_value, dict):
+        for key, value in field_value.items():
+            field_value[key] = _convert_mutable_datatypes(
+                value, reassign_field, field_name
+            )
+        field_value = PCDict(
+            field_value, reassign_field=reassign_field, field_name=field_name
+        )
+    return field_value

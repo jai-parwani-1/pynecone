@@ -1,20 +1,20 @@
 """The main Pynecone app."""
 
-import os
-import re
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Type, Union
 
-import fastapi
+from fastapi import FastAPI
 from fastapi.middleware import cors
+from socketio import ASGIApp, AsyncNamespace, AsyncServer
 
 from pynecone import constants, utils
 from pynecone.base import Base
 from pynecone.compiler import compiler
 from pynecone.compiler import utils as compiler_utils
 from pynecone.components.component import Component, ComponentStyle
-from pynecone.event import Event
+from pynecone.event import Event, EventHandler
 from pynecone.middleware import HydrateMiddleware, Middleware
 from pynecone.model import Model
+from pynecone.route import DECORATED_ROUTES
 from pynecone.state import DefaultState, Delta, State, StateManager, StateUpdate
 
 # Define custom types.
@@ -32,7 +32,13 @@ class App(Base):
     stylesheets: List[str] = []
 
     # The backend API object.
-    api: fastapi.FastAPI = None  # type: ignore
+    api: FastAPI = None  # type: ignore
+
+    # The Socket.IO AsyncServer.
+    sio: Optional[AsyncServer] = None
+
+    # The socket app.
+    socket_app: Optional[ASGIApp] = None
 
     # The state class to use for the app.
     state: Type[State] = DefaultState
@@ -46,6 +52,9 @@ class App(Base):
     # Middleware to add to the app.
     middleware: List[Middleware] = []
 
+    # Event handlers to trigger when a page loads.
+    load_events: Dict[str, EventHandler] = {}
+
     def __init__(self, *args, **kwargs):
         """Initialize the app.
 
@@ -55,6 +64,9 @@ class App(Base):
         """
         super().__init__(*args, **kwargs)
 
+        # Get the config
+        config = utils.get_config()
+
         # Add middleware.
         self.middleware.append(HydrateMiddleware())
 
@@ -62,9 +74,34 @@ class App(Base):
         self.state_manager.setup(state=self.state)
 
         # Set up the API.
-        self.api = fastapi.FastAPI()
+        self.api = FastAPI()
         self.add_cors()
         self.add_default_endpoints()
+
+        # Set up CORS options.
+        cors_allowed_origins = config.cors_allowed_origins
+        if config.cors_allowed_origins == [constants.CORS_ALLOWED_ORIGINS]:
+            cors_allowed_origins = "*"
+
+        # Set up the Socket.IO AsyncServer.
+        self.sio = AsyncServer(
+            async_mode="asgi",
+            cors_allowed_origins=cors_allowed_origins,
+            cors_credentials=config.cors_credentials,
+            max_http_buffer_size=config.polling_max_http_buffer_size,
+        )
+
+        # Create the socket app. Note event endpoint constant replaces the default 'socket.io' path.
+        self.socket_app = ASGIApp(self.sio, socketio_path="")
+
+        # Create the event namespace and attach the main app. Not related to any paths.
+        event_namespace = EventNamespace("/event", self)
+
+        # Register the event namespace with the socket.
+        self.sio.register_namespace(event_namespace)
+
+        # Mount the socket app with the API.
+        self.api.mount(str(constants.Endpoint.EVENT), self.socket_app)
 
     def __repr__(self) -> str:
         """Get the string representation of the app.
@@ -74,48 +111,27 @@ class App(Base):
         """
         return f"<App state={self.state.__name__}>"
 
+    def __call__(self) -> FastAPI:
+        """Run the backend api instance.
+
+        Returns:
+            The backend api.
+        """
+        return self.api
+
     def add_default_endpoints(self):
         """Add the default endpoints."""
         # To test the server.
-        self.get(str(constants.Endpoint.PING))(_ping)
-
-        # To make state changes.
-        self.post(str(constants.Endpoint.EVENT))(_event(app=self))
+        self.api.get(str(constants.Endpoint.PING))(ping)
 
     def add_cors(self):
         """Add CORS middleware to the app."""
         self.api.add_middleware(
             cors.CORSMiddleware,
-            allow_origins=["*"],
+            allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
         )
-
-    def get(self, path: str, *args, **kwargs) -> Callable:
-        """Register a get request.
-
-        Args:
-            path: The endpoint path to link to the request.
-            *args: Args to pass to the request.
-            **kwargs: Kwargs to pass to the request.
-
-        Returns:
-            A decorator to handle the request.
-        """
-        return self.api.get(path, *args, **kwargs)
-
-    def post(self, path: str, *args, **kwargs) -> Callable:
-        """Register a post request.
-
-        Args:
-            path: The endpoint path to link to the request.
-            *args: Args to pass to the request.
-            **kwargs: Kwargs to pass to the request.
-
-        Returns:
-            A decorator to handle the request.
-        """
-        return self.api.post(path, *args, **kwargs)
 
     def preprocess(self, state: State, event: Event) -> Optional[Delta]:
         """Preprocess the event.
@@ -177,10 +193,12 @@ class App(Base):
     def add_page(
         self,
         component: Union[Component, ComponentCallable],
-        path: Optional[str] = None,
+        route: Optional[str] = None,
         title: str = constants.DEFAULT_TITLE,
         description: str = constants.DEFAULT_DESCRIPTION,
         image=constants.DEFAULT_IMAGE,
+        on_load: Optional[EventHandler] = None,
+        path: Optional[str] = None,
     ):
         """Add a page to the app.
 
@@ -189,44 +207,114 @@ class App(Base):
 
         Args:
             component: The component to display at the page.
-            path: The path to display the component at.
+            path: (deprecated) The path to the component.
+            route: The route to display the component at.
+            title: The title of the page.
+            description: The description of the page.
+            image: The image to display on the page.
+            on_load: The event handler that will be called each time the page load.
+        """
+        if path is not None:
+            utils.deprecate(
+                "The `path` argument is deprecated for `add_page`. Use `route` instead."
+            )
+            route = path
+
+        # If the route is not set, get it from the callable.
+        if route is None:
+            assert isinstance(
+                component, Callable
+            ), "Route must be set if component is not a callable."
+            route = component.__name__
+
+        # Check if the route given is valid
+        utils.verify_route_validity(route)
+
+        # Apply dynamic args to the route.
+        self.state.setup_dynamic_args(utils.get_route_args(route))
+
+        # Generate the component if it is a callable.
+        component = component if isinstance(component, Component) else component()
+
+        # Add meta information to the component.
+        compiler_utils.add_meta(
+            component, title=title, image=image, description=description
+        )
+
+        # Format the route.
+        route = utils.format_route(route)
+
+        # Add the page.
+        self._check_routes_conflict(route)
+        self.pages[route] = component
+
+        if on_load:
+            self.load_events[route] = on_load
+
+    def _check_routes_conflict(self, new_route: str):
+        """Verify if there is any conflict between the new route and any existing route.
+
+        Based on conflicts that NextJS would throw if not intercepted.
+
+        Raises:
+            ValueError: exception showing which conflict exist with the route to be added
+
+        Args:
+            new_route: the route being newly added.
+        """
+        newroute_catchall = utils.catchall_in_route(new_route)
+        if not newroute_catchall:
+            return
+
+        for route in self.pages:
+            route = "" if route == "index" else route
+
+            if new_route.startswith(f"{route}/[[..."):
+                raise ValueError(
+                    f"You cannot define a route with the same specificity as a optional catch-all route ('{route}' and '{new_route}')"
+                )
+
+            route_catchall = utils.catchall_in_route(route)
+            if (
+                route_catchall
+                and newroute_catchall
+                and utils.catchall_prefix(route) == utils.catchall_prefix(new_route)
+            ):
+                raise ValueError(
+                    f"You cannot use multiple catchall for the same dynamic route ({route} !== {new_route})"
+                )
+
+    def add_custom_404_page(self, component, title=None, image=None, description=None):
+        """Define a custom 404 page for any url having no match.
+
+        If there is no page defined on 'index' route, add the 404 page to it.
+        If there is no global catchall defined, add the 404 page with a catchall
+
+        Args:
+            component: The component to display at the page.
             title: The title of the page.
             description: The description of the page.
             image: The image to display on the page.
         """
-        # If the path is not set, get it from the callable.
-        if path is None:
-            assert isinstance(
-                component, Callable
-            ), "Path must be set if component is not a callable."
-            path = component.__name__
+        title = title or constants.TITLE_404
+        image = image or constants.FAVICON_404
+        description = description or constants.DESCRIPTION_404
 
-        from pynecone.var import BaseVar
+        component = component if isinstance(component, Component) else component()
 
-        parts = os.path.split(path)
-        check = re.compile(r"^\[(.+)\]$")
-        args = []
-        for part in parts:
-            match = check.match(part)
-            if match:
-                v = BaseVar(
-                    name=match.groups()[0],
-                    type_=str,
-                    state=f"{constants.ROUTER}.query",
-                )
-                args.append(v)
+        compiler_utils.add_meta(
+            component, title=title, image=image, description=description
+        )
 
-        # Generate the component if it is a callable.
-        component = component if isinstance(component, Component) else component(*args)
-
-        # Add the title to the component.
-        compiler_utils.add_meta(component, title, description, image)
-
-        # Format the route.
-        route = utils.format_route(path)
-
-        # Add the page.
-        self.pages[route] = component
+        froute = utils.format_route
+        if (froute(constants.ROOT_404) not in self.pages) and (
+            not any(page.startswith("[[...") for page in self.pages)
+        ):
+            self.pages[froute(constants.ROOT_404)] = component
+        if not any(
+            page.startswith("[...") or page.startswith("[[...") for page in self.pages
+        ):
+            self.pages[froute(constants.SLUG_404)] = component
 
     def compile(self, force_compile: bool = False):
         """Compile the app and output it to the pages folder.
@@ -237,87 +325,91 @@ class App(Base):
         Args:
             force_compile: Whether to force the app to compile.
         """
+        for render, kwargs in DECORATED_ROUTES:
+            self.add_page(render, **kwargs)
+
         # Get the env mode.
         config = utils.get_config()
         if config.env != constants.Env.DEV and not force_compile:
             print("Skipping compilation in non-dev mode.")
             return
 
-        # Create the database models.
-        Model.create_all()
+        # Update models during hot reload.
+        if config.db_url is not None:
+            Model.create_all()
 
-        # Create the root document with base styles and fonts.
-        self.pages[constants.DOCUMENT_ROOT] = compiler_utils.create_document_root(
-            self.stylesheets
-        )
-        self.pages[constants.THEME] = compiler_utils.create_theme(self.style)  # type: ignore
+        # Empty the .web pages directory
+        compiler.purge_web_pages_dir()
 
-        # Compile the pages.
-        for path, component in self.pages.items():
-            self.compile_page(path, component)
-
-    def compile_page(
-        self, path: str, component: Component, write: bool = True
-    ) -> Tuple[str, str]:
-        """Compile a single page.
-
-        Args:
-            path: The path to compile the page to.
-            component: The component to compile.
-            write: Whether to write the page to the pages folder.
-
-        Returns:
-            The path and code of the compiled page.
-        """
-        # Get the path for the output file.
-        output_path = utils.get_page_path(path)
-
-        # Compile the document root.
-        if path == constants.DOCUMENT_ROOT:
-            code = compiler.compile_document_root(component)
+        # Compile the root document with base styles and fonts.
+        compiler.compile_document_root(self.stylesheets)
 
         # Compile the theme.
-        elif path == constants.THEME:
-            output_path = utils.get_theme_path()
-            code = compiler.compile_theme(component)  # type: ignore
+        compiler.compile_theme(self.style)
 
-        # Compile all other pages.
-        else:
-            # Add the style to the component.
+        # Compile the pages.
+        custom_components = set()
+        for route, component in self.pages.items():
             component.add_style(self.style)
-            code = compiler.compile_component(
-                component=component,
-                state=self.state,
-            )
+            compiler.compile_page(route, component, self.state)
 
-        # Write the page to the pages folder.
-        if write:
-            utils.write_page(output_path, code)
+            # Add the custom components from the page to the set.
+            custom_components |= component.get_custom_components()
 
-        return output_path, code
-
-    def get_state(self, token: str) -> State:
-        """Get the state for a token.
-
-        Args:
-            token: The token to get the state for.
-
-        Returns:
-            The state for the token.
-        """
-        return self.state_manager.get_state(token)
-
-    def set_state(self, token: str, state: State):
-        """Set the state for a token.
-
-        Args:
-            token: The token to set the state for.
-            state: The state to set.
-        """
-        self.state_manager.set_state(token, state)
+        # Compile the custom components.
+        compiler.compile_components(custom_components)
 
 
-async def _ping() -> str:
+async def process(
+    app: App, event: Event, sid: str, headers: Dict, client_ip: str
+) -> StateUpdate:
+    """Process an event.
+
+    Args:
+        app: The app to process the event for.
+        event: The event to process.
+        sid: The Socket.IO session id.
+        headers: The client headers.
+        client_ip: The client_ip.
+
+    Returns:
+        The state update after processing the event.
+    """
+    # Get the state for the session.
+    state = app.state_manager.get_state(event.token)
+
+    formatted_params = utils.format_query_params(event.router_data)
+
+    # Pass router_data to the state of the App.
+    state.router_data = event.router_data
+    # also pass router_data to all substates
+    for _, substate in state.substates.items():
+        substate.router_data = event.router_data
+    state.router_data[constants.RouteVar.QUERY] = formatted_params
+    state.router_data[constants.RouteVar.CLIENT_TOKEN] = event.token
+    state.router_data[constants.RouteVar.SESSION_ID] = sid
+    state.router_data[constants.RouteVar.HEADERS] = headers
+    state.router_data[constants.RouteVar.CLIENT_IP] = client_ip
+
+    # Preprocess the event.
+    pre = app.preprocess(state, event)
+    if pre is not None:
+        return StateUpdate(delta=pre)
+
+    # Apply the event to the state.
+    update = await state.process(event)
+    app.state_manager.set_state(event.token, state)
+
+    # Postprocess the event.
+    post = app.postprocess(state, event, update.delta)
+    if post is not None:
+        return StateUpdate(delta=post)
+
+    # Return the update.
+    return update
+
+
+async def ping() -> str:
     """Test API endpoint.
 
     Returns:
@@ -326,35 +418,73 @@ async def _ping() -> str:
     return "pong"
 
 
-def _event(app: App) -> Reducer:
-    """Create an event reducer to modify the state.
+class EventNamespace(AsyncNamespace):
+    """The event namespace."""
 
-    Args:
-        app: The app to modify the state of.
+    # The application object.
+    app: App
 
-    Returns:
-        A handler that takes in an event and modifies the state.
-    """
+    def __init__(self, namespace: str, app: App):
+        """Initialize the event namespace.
 
-    async def process(event: Event) -> StateUpdate:
-        # Get the state for the session.
-        state = app.get_state(event.token)
+        Args:
+            namespace: The namespace.
+            app: The application object.
+        """
+        super().__init__(namespace)
+        self.app = app
 
-        # Preprocess the event.
-        pre = app.preprocess(state, event)
-        if pre is not None:
-            return StateUpdate(delta=pre)
+    def on_connect(self, sid, environ):
+        """Event for when the websocket disconnects.
 
-        # Apply the event to the state.
-        update = await state.process(event)
-        app.set_state(event.token, state)
+        Args:
+            sid: The Socket.IO session id.
+            environ: The request information, including HTTP headers.
+        """
+        pass
 
-        # Postprocess the event.
-        post = app.postprocess(state, event, update.delta)
-        if post is not None:
-            return StateUpdate(delta=post)
+    def on_disconnect(self, sid):
+        """Event for when the websocket disconnects.
 
-        # Return the delta.
-        return update
+        Args:
+            sid: The Socket.IO session id.
+        """
+        pass
 
-    return process
+    async def on_event(self, sid, data):
+        """Event for receiving front-end websocket events.
+
+        Args:
+            sid: The Socket.IO session id.
+            data: The event data.
+        """
+        # Get the event.
+        event = Event.parse_raw(data)
+
+        # Get the event environment.
+        assert self.app.sio is not None
+        environ = self.app.sio.get_environ(sid, self.namespace)
+
+        # Get the client headers.
+        headers = {
+            k.decode("utf-8"): v.decode("utf-8")
+            for (k, v) in environ["asgi.scope"]["headers"]
+        }
+
+        # Get the client IP
+        client_ip = environ["REMOTE_ADDR"]
+
+        # Process the event.
+        update = await process(self.app, event, sid, headers, client_ip)
+
+        # Emit the event.
+        await self.emit(str(constants.SocketEvent.EVENT), update.json(), to=sid)
+
+    async def on_ping(self, sid):
+        """Event for testing the API endpoint.
+
+        Args:
+            sid: The Socket.IO session id.
+        """
+        # Emit the test event.
+        await self.emit(str(constants.SocketEvent.PING), "pong", to=sid)

@@ -3,8 +3,17 @@ from __future__ import annotations
 
 import json
 from abc import ABC
-from typing import _GenericAlias  # type: ignore
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Type,
+    Union,
+    _GenericAlias,  # type: ignore
+)
 
 from plotly.graph_objects import Figure
 from plotly.io import to_json
@@ -61,10 +70,10 @@ class Var(ABC):
 
         # Special case for plotly figures.
         if isinstance(value, Figure):
-            value = json.loads(to_json(value))["data"]
+            value = json.loads(to_json(value))["data"]  # type: ignore
             type_ = Figure
 
-        name = json.dumps(value) if not isinstance(value, str) else value
+        name = value if isinstance(value, str) else json.dumps(value)
 
         return BaseVar(name=name, type_=type_, is_local=is_local, is_string=is_string)
 
@@ -118,10 +127,7 @@ class Var(ABC):
         Returns:
             The wrapped var, i.e. {state.var}.
         """
-        if self.is_local:
-            out = self.full_name
-        else:
-            out = utils.wrap(self.full_name, "{")
+        out = self.full_name if self.is_local else utils.wrap(self.full_name, "{")
         if self.is_string:
             out = utils.format_string(out)
         return out
@@ -138,31 +144,68 @@ class Var(ABC):
         Raises:
             TypeError: If the var is not indexable.
         """
+        # Indexing is only supported for lists, dicts, and dataframes.
+        if not (
+            utils._issubclass(self.type_, Union[List, Dict])
+            or utils.is_dataframe(self.type_)
+        ):
+            if self.type_ == Any:
+                raise TypeError(
+                    f"Could not index into var of type Any. (If you are trying to index into a state var, add a type annotation to the var.)"
+                )
+            raise TypeError(
+                f"Var {self.name} of type {self.type_} does not support indexing."
+            )
+
         # The type of the indexed var.
-        type_ = str
+        type_ = Any
 
         # Convert any vars to local vars.
         if isinstance(i, Var):
             i = BaseVar(name=i.name, type_=i.type_, state=i.state, is_local=True)
 
+        # Handle list indexing.
         if utils._issubclass(self.type_, List):
-            assert isinstance(
-                i, utils.get_args(Union[int, Var])
-            ), "Index must be an integer."
+            # List indices must be ints, slices, or vars.
+            if not isinstance(i, utils.get_args(Union[int, slice, Var])):
+                raise TypeError("Index must be an integer.")
+
+            # Handle slices first.
+            if isinstance(i, slice):
+                # Get the start and stop indices.
+                start = i.start or 0
+                stop = i.stop or "undefined"
+
+                # Use the slice function.
+                return BaseVar(
+                    name=f"{self.name}.slice({start}, {stop})",
+                    type_=self.type_,
+                    state=self.state,
+                )
+
+            # Get the type of the indexed var.
             if utils.is_generic_alias(self.type_):
                 type_ = utils.get_args(self.type_)[0]
             else:
                 type_ = Any
-        elif utils._issubclass(self.type_, Dict) or utils.is_dataframe(self.type_):
-            if isinstance(i, str):
-                i = utils.wrap(i, '"')
-            if utils.is_generic_alias(self.type_):
-                type_ = utils.get_args(self.type_)[1]
-            else:
-                type_ = Any
-        else:
-            raise TypeError("Var does not support indexing.")
 
+            # Use `at` to support negative indices.
+            return BaseVar(
+                name=f"{self.name}.at({i})",
+                type_=type_,
+                state=self.state,
+            )
+
+        # Dictionary / dataframe indexing.
+        # Get the type of the indexed var.
+        if isinstance(i, str):
+            i = utils.wrap(i, '"')
+        if utils.is_generic_alias(self.type_):
+            type_ = utils.get_args(self.type_)[1]
+        else:
+            type_ = Any
+
+        # Use normal indexing here.
         return BaseVar(
             name=f"{self.name}[{i}]",
             type_=type_,
@@ -190,7 +233,7 @@ class Var(ABC):
                 and hasattr(self.type_, "__fields__")
                 and name in self.type_.__fields__
             ):
-                type_ = self.type_.__fields__[name].type_
+                type_ = self.type_.__fields__[name].outer_type_
                 if isinstance(type_, ModelField):
                     type_ = type_.type_
                 return BaseVar(
@@ -230,7 +273,7 @@ class Var(ABC):
         if other is None:
             name = f"{op}{self.full_name}"
         else:
-            props = (self, other) if not flip else (other, self)
+            props = (other, self) if flip else (self, other)
             name = f"{props[0].full_name} {op} {props[1].full_name}"
             if fn is None:
                 name = utils.wrap(name, "(")
@@ -276,6 +319,22 @@ class Var(ABC):
             A var with the absolute value.
         """
         return self.operation(fn="Math.abs")
+
+    def length(self) -> Var:
+        """Get the length of a list var.
+
+        Returns:
+            A var with the absolute value.
+
+        Raises:
+            TypeError: If the var is not a list.
+        """
+        if not utils._issubclass(self.type_, List):
+            raise TypeError(f"Cannot get length of non-list var {self}.")
+        return BaseVar(
+            name=f"{self.full_name}.length",
+            type_=int,
+        )
 
     def __eq__(self, other: Var) -> Var:
         """Perform an equality comparison.
@@ -571,9 +630,7 @@ class Var(ABC):
         Returns:
             The full name of the var.
         """
-        if self.state == "":
-            return self.name
-        return ".".join([self.state, self.name])
+        return self.name if self.state == "" else ".".join([self.state, self.name])
 
     def set_state(self, state: Type[State]) -> Any:
         """Set the state of the var.
@@ -603,6 +660,7 @@ class BaseVar(Var, Base):
     # Whether this is a local javascript variable.
     is_local: bool = False
 
+    # Whether this var is a raw string.
     is_string: bool = False
 
     def __hash__(self) -> int:
@@ -619,7 +677,7 @@ class BaseVar(Var, Base):
         Returns:
             The default value of the var.
         """
-        if isinstance(self.type_, _GenericAlias):
+        if utils.is_generic_alias(self.type_):
             type_ = self.type_.__origin__
         else:
             type_ = self.type_
@@ -635,9 +693,7 @@ class BaseVar(Var, Base):
             return {}
         if issubclass(type_, tuple):
             return ()
-        if issubclass(type_, set):
-            return set()
-        return None
+        return set() if issubclass(type_, set) else None
 
     def get_setter_name(self, include_state: bool = True) -> str:
         """Get the name of the var's generated setter function.
@@ -673,14 +729,6 @@ class BaseVar(Var, Base):
 
         return setter
 
-    def json(self) -> str:
-        """Convert the object to a json string.
-
-        Returns:
-            The object as a json string.
-        """
-        return self.__config__.json_dumps(self.dict())
-
 
 class ComputedVar(property, Var):
     """A field with computed getters."""
@@ -705,3 +753,179 @@ class ComputedVar(property, Var):
         if "return" in self.fget.__annotations__:
             return self.fget.__annotations__["return"]
         return Any
+
+
+class PCList(list):
+    """A custom list that pynecone can detect its mutation."""
+
+    def __init__(
+        self,
+        original_list: List,
+        reassign_field: Callable = lambda _field_name: None,
+        field_name: str = "",
+    ):
+        """Initialize PCList.
+
+        Args:
+            original_list (List): The original list
+            reassign_field (Callable):
+                The method in the parent state to reassign the field.
+                Default to be a no-op function
+            field_name (str): the name of field in the parent state
+        """
+        self._reassign_field = lambda: reassign_field(field_name)
+
+        super().__init__(original_list)
+
+    def append(self, *args, **kwargs):
+        """Append.
+
+        Args:
+            args: The args passed.
+            kwargs: The kwargs passed.
+        """
+        super().append(*args, **kwargs)
+        self._reassign_field()
+
+    def __setitem__(self, *args, **kwargs):
+        """Set item.
+
+        Args:
+            args: The args passed.
+            kwargs: The kwargs passed.
+        """
+        super().__setitem__(*args, **kwargs)
+        self._reassign_field()
+
+    def __delitem__(self, *args, **kwargs):
+        """Delete item.
+
+        Args:
+            args: The args passed.
+            kwargs: The kwargs passed.
+        """
+        super().__delitem__(*args, **kwargs)
+        self._reassign_field()
+
+    def clear(self, *args, **kwargs):
+        """Remove all item from the list.
+
+        Args:
+            args: The args passed.
+            kwargs: The kwargs passed.
+        """
+        super().clear(*args, **kwargs)
+        self._reassign_field()
+
+    def extend(self, *args, **kwargs):
+        """Add all item of a list to the end of the list.
+
+        Args:
+            args: The args passed.
+            kwargs: The kwargs passed.
+        """
+        super().extend(*args, **kwargs)
+        self._reassign_field() if hasattr(self, "_reassign_field") else None
+
+    def pop(self, *args, **kwargs):
+        """Remove an element.
+
+        Args:
+            args: The args passed.
+            kwargs: The kwargs passed.
+        """
+        super().pop(*args, **kwargs)
+        self._reassign_field()
+
+    def remove(self, *args, **kwargs):
+        """Remove an element.
+
+        Args:
+            args: The args passed.
+            kwargs: The kwargs passed.
+        """
+        super().remove(*args, **kwargs)
+        self._reassign_field()
+
+
+class PCDict(dict):
+    """A custom dict that pynecone can detect its mutation."""
+
+    def __init__(
+        self,
+        original_dict: Dict,
+        reassign_field: Callable = lambda _field_name: None,
+        field_name: str = "",
+    ):
+        """Initialize PCDict.
+
+        Args:
+            original_dict: The original dict
+            reassign_field:
+                The method in the parent state to reassign the field.
+                Default to be a no-op function
+            field_name: the name of field in the parent state
+        """
+        super().__init__(original_dict)
+        self._reassign_field = lambda: reassign_field(field_name)
+
+    def clear(self):
+        """Remove all item from the list."""
+        super().clear()
+
+        self._reassign_field()
+
+    def setdefault(self, *args, **kwargs):
+        """Return value of key if or set default.
+
+        Args:
+            args: The args passed.
+            kwargs: The kwargs passed.
+        """
+        super().setdefault(*args, **kwargs)
+        self._reassign_field()
+
+    def popitem(self):
+        """Pop last item."""
+        super().popitem()
+        self._reassign_field()
+
+    def pop(self, k, d=None):
+        """Remove an element.
+
+        Args:
+            k: The args passed.
+            d: The kwargs passed.
+        """
+        super().pop(k, d)
+        self._reassign_field()
+
+    def update(self, *args, **kwargs):
+        """Update the dict with another dict.
+
+        Args:
+            args: The args passed.
+            kwargs: The kwargs passed.
+        """
+        super().update(*args, **kwargs)
+        self._reassign_field()
+
+    def __setitem__(self, *args, **kwargs):
+        """Set an item in the dict.
+
+        Args:
+            args: The args passed.
+            kwargs: The kwargs passed.
+        """
+        super().__setitem__(*args, **kwargs)
+        self._reassign_field() if hasattr(self, "_reassign_field") else None
+
+    def __delitem__(self, *args, **kwargs):
+        """Delete an item in the dict.
+
+        Args:
+            args: The args passed.
+            kwargs: The kwargs passed.
+        """
+        super().__delitem__(*args, **kwargs)
+        self._reassign_field()

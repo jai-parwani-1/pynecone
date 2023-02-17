@@ -8,10 +8,8 @@ from pynecone.utils import join
 # Template for the Pynecone config file.
 PCCONFIG = f"""import pynecone as pc
 
-
 config = pc.Config(
     app_name="{{app_name}}",
-    bun_path="{constants.BUN_PATH}",
     db_url="{constants.DB_URL}",
     env=pc.Env.DEV,
 )
@@ -36,8 +34,8 @@ def format_import(lib: str, default: str = "", rest: Optional[Set[str]] = None) 
         The compiled import statement.
     """
     # Handle the case of direct imports with no libraries.
-    if lib == "":
-        assert default == "", "No default field allowed for empty library."
+    if not lib:
+        assert not default, "No default field allowed for empty library."
         assert rest is not None and len(rest) > 0, "No fields to import."
         return join([IMPORT_LIB(lib=lib) for lib in sorted(rest)])
 
@@ -46,12 +44,11 @@ def format_import(lib: str, default: str = "", rest: Optional[Set[str]] = None) 
     if len(default) == 0 and len(rest) == 0:
         # Handle the case of importing a library with no fields.
         return IMPORT_LIB(lib=lib)
-    else:
-        # Handle importing specific fields from a library.
-        others = f'{{{", ".join(sorted(rest))}}}' if len(rest) > 0 else ""
-        if len(default) > 0 and len(rest) > 0:
-            default += ", "
-        return IMPORT_FIELDS(default=default, others=others, lib=lib)
+    # Handle importing specific fields from a library.
+    others = f'{{{", ".join(sorted(rest))}}}' if len(rest) > 0 else ""
+    if default != "" and len(rest) > 0:
+        default += ", "
+    return IMPORT_FIELDS(default=default, others=others, lib=lib)
 
 
 # Code to render a NextJS Document root.
@@ -69,8 +66,8 @@ DOCUMENT_ROOT = join(
 # Template for the theme file.
 THEME = "export default {theme}".format
 
-# Code to render a single NextJS component.
-COMPONENT = join(
+# Code to render a single NextJS page.
+PAGE = join(
     [
         "{imports}",
         "{custom_code}",
@@ -85,6 +82,24 @@ COMPONENT = join(
         "}}",
     ]
 ).format
+
+# Code to render a single exported custom component.
+COMPONENT = join(
+    [
+        "export const {name} = memo(({{{props}}}) => (",
+        "{render}",
+        "))",
+    ]
+).format
+
+# Code to render the custom components page.
+COMPONENTS = join(
+    [
+        "{imports}",
+        "{components}",
+    ]
+).format
+
 
 # React state declarations.
 USE_STATE = CONST(
@@ -137,12 +152,20 @@ EVENT_FN = join(
 ROUTER = constants.ROUTER
 RESULT = constants.RESULT
 PROCESSING = constants.PROCESSING
+SOCKET = constants.SOCKET
 STATE = constants.STATE
 EVENTS = constants.EVENTS
 SET_RESULT = format_state_setter(RESULT)
+READY = f"const {{ isReady }} = {ROUTER};"
 USE_EFFECT = join(
     [
         "useEffect(() => {{",
+        "  if(!isReady) {{",
+        "    return;",
+        "  }}",
+        f"  if (!{SOCKET}.current) {{{{",
+        f"    connect({SOCKET}, {{state}}, {{set_state}}, {RESULT}, {SET_RESULT}, {ROUTER}, {EVENT_ENDPOINT}, {{transports}})",
+        "  }}",
         "  const update = async () => {{",
         f"    if ({RESULT}.{STATE} != null) {{{{",
         f"      {{set_state}}({{{{",
@@ -155,7 +178,7 @@ USE_EFFECT = join(
         f"        {PROCESSING}: false,",
         "      }})",
         "    }}",
-        f"    await updateState({{state}}, {RESULT}, {SET_RESULT}, {EVENT_ENDPOINT}, {ROUTER})",
+        f"    await updateState({{state}}, {{set_state}}, {RESULT}, {SET_RESULT}, {ROUTER}, {SOCKET}.current)",
         "  }}",
         "  update()",
         "}})",
@@ -164,3 +187,12 @@ USE_EFFECT = join(
 
 # Routing
 ROUTER = f"const {constants.ROUTER} = useRouter()"
+
+# Sockets.
+SOCKET = "const socket = useRef(null)"
+
+# Color toggle
+COLORTOGGLE = f"const {{ {constants.COLOR_MODE}, {constants.TOGGLE_COLOR_MODE} }} = {constants.USE_COLOR_MODE}()"
+
+# Sitemap config file.
+SITEMAP_CONFIG = "module.exports = {config}".format

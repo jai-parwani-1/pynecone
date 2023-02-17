@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from typing import Any, Callable, Dict, List, Set, Tuple
 
 from pynecone.base import Base
@@ -16,6 +17,9 @@ class Event(Base):
 
     # The event name.
     name: str
+
+    # The routing data where event occurred
+    router_data: Dict[str, Any] = {}
 
     # The event payload.
     payload: Dict[str, Any] = {}
@@ -43,12 +47,29 @@ class EventHandler(Base):
 
         Returns:
             The event spec, containing both the function and args.
+
+        Raises:
+            TypeError: If the arguments are invalid.
         """
         # Get the function args.
         fn_args = inspect.getfullargspec(self.fn).args[1:]
 
         # Construct the payload.
-        payload = tuple(zip(fn_args, [Var.create(arg).full_name for arg in args]))  # type: ignore
+        values = []
+        for arg in args:
+            # If it is a Var, add the full name.
+            if isinstance(arg, Var):
+                values.append(arg.full_name)
+                continue
+
+            # Otherwise, convert to JSON.
+            try:
+                values.append(json.dumps(arg, ensure_ascii=False))
+            except TypeError as e:
+                raise TypeError(
+                    f"Arguments to event handlers must be Vars or JSON-serializable. Got {arg} of type {type(arg)}."
+                ) from e
+        payload = tuple(zip(fn_args, values))
 
         # Return the event spec.
         return EventSpec(handler=self, args=payload)
@@ -94,6 +115,7 @@ class FrontendEvent(Base):
     """A Javascript event."""
 
     target: Target = Target()
+    key: str = ""
 
 
 # The default event argument.

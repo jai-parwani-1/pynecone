@@ -2,6 +2,7 @@
 
 from .button import Button, ButtonGroup
 from .checkbox import Checkbox, CheckboxGroup
+from .copytoclipboard import CopyToClipboard
 from .editable import Editable, EditableInput, EditablePreview, EditableTextarea
 from .formcontrol import FormControl, FormErrorMessage, FormHelperText, FormLabel
 from .iconbutton import IconButton
@@ -13,6 +14,7 @@ from .numberinput import (
     NumberInputField,
     NumberInputStepper,
 )
+from .password import Password
 from .pininput import PinInput, PinInputField
 from .radio import Radio, RadioGroup
 from .rangeslider import (

@@ -11,8 +11,13 @@ def get_engine():
 
     Returns:
         The database engine.
+
+    Raises:
+        ValueError: If the database url is None.
     """
     url = utils.get_config().db_url
+    if url is None:
+        raise ValueError("No database url in config")
     return sqlmodel.create_engine(url, echo=False)
 
 
@@ -21,6 +26,17 @@ class Model(Base, sqlmodel.SQLModel):
 
     # The primary key for the table.
     id: int = sqlmodel.Field(primary_key=True)
+
+    def dict(self, **kwargs):
+        """Convert the object to a dictionary.
+
+        Args:
+            kwargs: Ignored but needed for compatibility.
+
+        Returns:
+            The object as a dictionary.
+        """
+        return {name: getattr(self, name) for name in self.__fields__}
 
     @staticmethod
     def create_all():

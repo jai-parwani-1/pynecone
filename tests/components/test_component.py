@@ -1,10 +1,27 @@
-from typing import Type
+from typing import Dict, List, Type
 
 import pytest
 
-from pynecone.components.component import Component, ImportDict
-from pynecone.event import EventHandler
+from pynecone.components.component import Component, CustomComponent, ImportDict
+from pynecone.components.layout.box import Box
+from pynecone.event import EVENT_ARG, EVENT_TRIGGERS, EventHandler
+from pynecone.state import State
 from pynecone.style import Style
+from pynecone.var import Var
+
+
+@pytest.fixture
+def TestState():
+    class TestState(State):
+        num: int
+
+        def do_something(self):
+            pass
+
+        def do_something_arg(self, arg):
+            pass
+
+    return TestState
 
 
 @pytest.fixture
@@ -16,6 +33,12 @@ def component1() -> Type[Component]:
     """
 
     class TestComponent1(Component):
+        # A test string prop.
+        text: Var[str]
+
+        # A test number prop.
+        number: Var[int]
+
         def _get_imports(self) -> ImportDict:
             return {"react": {"Component"}}
 
@@ -34,6 +57,21 @@ def component2() -> Type[Component]:
     """
 
     class TestComponent2(Component):
+        # A test list prop.
+        arr: Var[List[str]]
+
+        @classmethod
+        def get_controlled_triggers(cls) -> Dict[str, Var]:
+            """Test controlled triggers.
+
+            Returns:
+                Test controlled triggers.
+            """
+            return {
+                "on_open": EVENT_ARG,
+                "on_close": EVENT_ARG,
+            }
+
         def _get_imports(self) -> ImportDict:
             return {"react-redux": {"connect"}}
 
@@ -71,7 +109,21 @@ def on_click2() -> EventHandler:
     return EventHandler(fn=on_click2)
 
 
-def test_set_style_attrs(component1: Type[Component]):
+@pytest.fixture
+def my_component():
+    """A test component function.
+
+    Returns:
+        A test component function.
+    """
+
+    def my_component(prop1: Var[str], prop2: Var[int]):
+        return Box.create(prop1, prop2)
+
+    return my_component
+
+
+def test_set_style_attrs(component1):
     """Test that style attributes are set in the dict.
 
     Args:
@@ -82,7 +134,7 @@ def test_set_style_attrs(component1: Type[Component]):
     assert component.style["textAlign"] == "center"
 
 
-def test_create_component(component1: Type[Component]):
+def test_create_component(component1):
     """Test that the component is created correctly.
 
     Args:
@@ -96,7 +148,7 @@ def test_create_component(component1: Type[Component]):
     assert c.style == {"color": "white", "textAlign": "center"}
 
 
-def test_add_style(component1: Type[Component], component2: Type[Component]):
+def test_add_style(component1, component2):
     """Test adding a style to a component.
 
     Args:
@@ -113,7 +165,7 @@ def test_add_style(component1: Type[Component], component2: Type[Component]):
     assert c2.style["color"] == "black"
 
 
-def test_get_imports(component1: Type[Component], component2: Type[Component]):
+def test_get_imports(component1, component2):
     """Test getting the imports of a component.
 
     Args:
@@ -126,7 +178,7 @@ def test_get_imports(component1: Type[Component], component2: Type[Component]):
     assert c2.get_imports() == {"react-redux": {"connect"}, "react": {"Component"}}
 
 
-def test_get_custom_code(component1: Type[Component], component2: Type[Component]):
+def test_get_custom_code(component1, component2):
     """Test getting the custom code of a component.
 
     Args:
@@ -152,3 +204,139 @@ def test_get_custom_code(component1: Type[Component], component2: Type[Component
         "console.log('component1')",
         "console.log('component2')",
     }
+
+
+def test_get_props(component1, component2):
+    """Test that the props are set correctly.
+
+    Args:
+        component1: A test component.
+        component2: A test component.
+    """
+    assert component1.get_props() == {"text", "number"}
+    assert component2.get_props() == {"arr"}
+
+
+@pytest.mark.parametrize(
+    "text,number",
+    [
+        ("", 0),
+        ("test", 1),
+        ("hi", -13),
+    ],
+)
+def test_valid_props(component1, text: str, number: int):
+    """Test that we can construct a component with valid props.
+
+    Args:
+        component1: A test component.
+        text: A test string.
+        number: A test number.
+    """
+    c = component1.create(text=text, number=number)
+    assert c.text == text
+    assert c.number == number
+
+
+@pytest.mark.parametrize(
+    "text,number", [("", "bad_string"), (13, 1), (None, 1), ("test", [1, 2, 3])]
+)
+def test_invalid_prop_type(component1, text: str, number: int):
+    """Test that an invalid prop type raises an error.
+
+    Args:
+        component1: A test component.
+        text: A test string.
+        number: A test number.
+    """
+    # Check that
+    with pytest.raises(TypeError):
+        component1.create(text=text, number=number)
+
+
+def test_var_props(component1, TestState):
+    """Test that we can set a Var prop.
+
+    Args:
+        component1: A test component.
+        TestState: A test state.
+    """
+    c1 = component1.create(text="hello", number=TestState.num)
+    assert c1.number == TestState.num
+
+
+def test_get_controlled_triggers(component1, component2):
+    """Test that we can get the controlled triggers of a component.
+
+    Args:
+        component1: A test component.
+        component2: A test component.
+    """
+    assert component1.get_controlled_triggers() == dict()
+    assert set(component2.get_controlled_triggers()) == {"on_open", "on_close"}
+
+
+def test_get_triggers(component1, component2):
+    """Test that we can get the triggers of a component.
+
+    Args:
+        component1: A test component.
+        component2: A test component.
+    """
+    assert component1.get_triggers() == EVENT_TRIGGERS
+    assert component2.get_triggers() == {"on_open", "on_close"} | EVENT_TRIGGERS
+
+
+def test_create_custom_component(my_component):
+    """Test that we can create a custom component.
+
+    Args:
+        my_component: A test custom component.
+    """
+    component = CustomComponent(component_fn=my_component, prop1="test", prop2=1)
+    assert component.tag == "MyComponent"
+    assert component.get_props() == set()
+    assert component.get_custom_components() == {component}
+
+
+def test_custom_component_hash(my_component):
+    """Test that the hash of a custom component is correct.
+
+    Args:
+        my_component: A test custom component.
+    """
+    component1 = CustomComponent(component_fn=my_component, prop1="test", prop2=1)
+    component2 = CustomComponent(component_fn=my_component, prop1="test", prop2=2)
+    assert {component1, component2} == {component1}
+
+
+def test_invalid_event_handler_args(component2, TestState):
+    """Test that an invalid event handler raises an error.
+
+    Args:
+        component2: A test component.
+        TestState: A test state.
+    """
+    # Uncontrolled event handlers should not take args.
+    # This is okay.
+    component2.create(on_click=TestState.do_something)
+    # This is not okay.
+    with pytest.raises(ValueError):
+        component2.create(on_click=TestState.do_something_arg)
+    # However lambdas are okay.
+    component2.create(on_click=lambda: TestState.do_something_arg(1))
+    component2.create(
+        on_click=lambda: [TestState.do_something_arg(1), TestState.do_something]
+    )
+    component2.create(
+        on_click=lambda: [TestState.do_something_arg(1), TestState.do_something()]
+    )
+
+    # Controlled event handlers should take args.
+    # This is okay.
+    component2.create(on_open=TestState.do_something_arg)
+    # This is not okay.
+    with pytest.raises(ValueError):
+        component2.create(on_open=TestState.do_something)
+    with pytest.raises(ValueError):
+        component2.create(on_open=[TestState.do_something_arg, TestState.do_something])

@@ -1,11 +1,11 @@
 """A select component."""
 
-from typing import Any, Set
+from typing import Any, Dict, List
 
 from pynecone import utils
 from pynecone.components.component import EVENT_ARG, Component
+from pynecone.components.layout.foreach import Foreach
 from pynecone.components.libs.chakra import ChakraComponent
-from pynecone.components.tags import Tag
 from pynecone.components.typography.text import Text
 from pynecone.var import Var
 
@@ -46,22 +46,15 @@ class Select(ChakraComponent):
     variant: Var[str]
 
     @classmethod
-    def get_controlled_triggers(cls) -> Set[str]:
+    def get_controlled_triggers(cls) -> Dict[str, Var]:
         """Get the event triggers that pass the component's value to the handler.
 
         Returns:
-            The controlled event triggers.
+            A dict mapping the event trigger to the var that is passed to the handler.
         """
-        return {"on_change"}
-
-    @classmethod
-    def get_controlled_value(cls) -> Var:
-        """Get the var that is passed to the event handler for controlled triggers.
-
-        Returns:
-            The controlled value.
-        """
-        return EVENT_ARG.target.value
+        return {
+            "on_change": EVENT_ARG.target.value,
+        }
 
     @classmethod
     def create(cls, *children, **props) -> Component:
@@ -79,6 +72,12 @@ class Select(ChakraComponent):
         """
         if len(children) == 1 and isinstance(children[0], list):
             children = [Option.create(child) for child in children[0]]
+        if (
+            len(children) == 1
+            and isinstance(children[0], Var)
+            and utils._issubclass(children[0].type_, List)
+        ):
+            children = [Foreach.create(children[0], lambda item: Option.create(item))]
         return super().create(*children, **props)
 
 

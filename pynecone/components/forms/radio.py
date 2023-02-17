@@ -1,11 +1,14 @@
 """A radio component."""
 
 
-from typing import Any, Set
+from typing import Any, Dict, List
 
+from pynecone import utils
 from pynecone.components.component import Component
+from pynecone.components.layout.foreach import Foreach
 from pynecone.components.libs.chakra import ChakraComponent
 from pynecone.components.typography.text import Text
+from pynecone.event import EVENT_ARG
 from pynecone.var import Var
 
 
@@ -18,13 +21,15 @@ class RadioGroup(ChakraComponent):
     value: Var[Any]
 
     @classmethod
-    def get_controlled_triggers(cls) -> Set[str]:
+    def get_controlled_triggers(cls) -> Dict[str, Var]:
         """Get the event triggers that pass the component's value to the handler.
 
         Returns:
-            The controlled event triggers.
+            A dict mapping the event trigger to the var that is passed to the handler.
         """
-        return {"on_change"}
+        return {
+            "on_change": EVENT_ARG,
+        }
 
     @classmethod
     def create(cls, *children, **props) -> Component:
@@ -39,6 +44,12 @@ class RadioGroup(ChakraComponent):
         """
         if len(children) == 1 and isinstance(children[0], list):
             children = [Radio.create(child) for child in children[0]]
+        if (
+            len(children) == 1
+            and isinstance(children[0], Var)
+            and utils._issubclass(children[0].type_, List)
+        ):
+            children = [Foreach.create(children[0], lambda item: Radio.create(item))]
         return super().create(*children, **props)
 
 

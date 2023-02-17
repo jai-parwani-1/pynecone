@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import typing
 from abc import ABC
+from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Set, Type, Union
 
-from pynecone import utils
+from pynecone import constants, utils
 from pynecone.base import Base
 from pynecone.components.tags import Tag
 from pynecone.event import (
@@ -16,7 +18,7 @@ from pynecone.event import (
     EventSpec,
 )
 from pynecone.style import Style
-from pynecone.var import Var
+from pynecone.var import BaseVar, Var
 
 ImportDict = Dict[str, Set[str]]
 
@@ -31,7 +33,7 @@ class Component(Base, ABC):
     style: Style = Style()
 
     # A mapping from event triggers to event chains.
-    event_triggers: Dict[str, EventChain] = {}
+    event_triggers: Dict[str, Union[EventChain, Var]] = {}
 
     # The library that the component is based on.
     library: Optional[str] = None
@@ -41,6 +43,12 @@ class Component(Base, ABC):
 
     # A unique key for the component.
     key: Any = None
+
+    # The id for the component.
+    id: Any = None
+
+    # The class name for the component.
+    class_name: Any = None
 
     @classmethod
     def __init_subclass__(cls, **kwargs):
@@ -71,6 +79,9 @@ class Component(Base, ABC):
         Args:
             *args: Args to initialize the component.
             **kwargs: Kwargs to initialize the component.
+
+        Raises:
+            TypeError: If an invalid prop is passed.
         """
         # Get the component fields, triggers, and props.
         fields = self.get_fields()
@@ -87,23 +98,34 @@ class Component(Base, ABC):
             if key in triggers:
                 # Event triggers are bound to event chains.
                 field_type = EventChain
-            else:
-                # If the key is not in the fields, skip it.
-                if key not in props:
-                    continue
-
+            elif key in props:
                 # Set the field type.
                 field_type = fields[key].type_
 
+            else:
+                continue
+
             # Check whether the key is a component prop.
             if utils._issubclass(field_type, Var):
-                # Convert any constants into vars and make sure the types match.
-                kwargs[key] = Var.create(value)
-                passed_type = kwargs[key].type_
-                expected_type = fields[key].outer_type_.__args__[0]
-                assert utils._issubclass(
-                    passed_type, expected_type
-                ), f"Invalid var passed for {key}, expected {expected_type}, got {passed_type}."
+                try:
+                    # Try to create a var from the value.
+                    kwargs[key] = Var.create(value)
+
+                    # Check that the var type is not None.
+                    if kwargs[key] is None:
+                        raise TypeError
+
+                    # Get the passed type and the var type.
+                    passed_type = kwargs[key].type_
+                    expected_type = fields[key].outer_type_.__args__[0]
+                except TypeError:
+                    # If it is not a valid var, check the base types.
+                    passed_type = type(value)
+                    expected_type = fields[key].outer_type_
+                if not utils._issubclass(passed_type, expected_type):
+                    raise TypeError(
+                        f"Invalid var passed for prop {key}, expected type {expected_type}, got value {value} of type {passed_type}."
+                    )
 
             # Check if the key is an event trigger.
             if key in triggers:
@@ -114,12 +136,22 @@ class Component(Base, ABC):
             del kwargs[key]
 
         # Add style props to the component.
+        style = kwargs.get("style", {})
+        if isinstance(style, List):
+            # Merge styles, the later ones overriding keys in the earlier ones.
+            style = {k: v for style_dict in style for k, v in style_dict.items()}
+
         kwargs["style"] = Style(
             {
-                **kwargs.get("style", {}),
+                **style,
                 **{attr: value for attr, value in kwargs.items() if attr not in fields},
             }
         )
+
+        # Convert class_name to str if it's list
+        class_name = kwargs.get("class_name", "")
+        if isinstance(class_name, (List, tuple)):
+            kwargs["class_name"] = " ".join(class_name)
 
         # Construct the component.
         super().__init__(*args, **kwargs)
@@ -127,8 +159,8 @@ class Component(Base, ABC):
     def _create_event_chain(
         self,
         event_trigger: str,
-        value: Union[EventHandler, List[EventHandler], Callable],
-    ) -> EventChain:
+        value: Union[Var, EventHandler, List[EventHandler], Callable],
+    ) -> Union[EventChain, Var]:
         """Create an event chain from a variety of input types.
 
         Args:
@@ -141,7 +173,17 @@ class Component(Base, ABC):
         Raises:
             ValueError: If the value is not a valid event chain.
         """
-        arg = self.get_controlled_value()
+        # Check if the trigger is a controlled event.
+        controlled_triggers = self.get_controlled_triggers()
+        is_controlled_event = event_trigger in controlled_triggers
+
+        # If it's an event chain var, return it.
+        if isinstance(value, Var):
+            if value.type_ is not EventChain:
+                raise ValueError(f"Invalid event chain: {value}")
+            return value
+
+        arg = controlled_triggers.get(event_trigger, EVENT_ARG)
 
         # If the input is a single event handler, wrap it in a list.
         if isinstance(value, EventHandler):
@@ -149,7 +191,25 @@ class Component(Base, ABC):
 
         # If the input is a list of event handlers, create an event chain.
         if isinstance(value, List):
-            events = [utils.call_event_handler(v, arg) for v in value]
+            events = []
+            for v in value:
+                if isinstance(v, EventHandler):
+                    # Call the event handler to get the event.
+                    event = utils.call_event_handler(v, arg)
+
+                    # Check that the event handler takes no args if it's uncontrolled.
+                    if not is_controlled_event and len(event.args) > 0:
+                        raise ValueError(
+                            f"Event handler: {v.fn} for uncontrolled event {event_trigger} should not take any args."
+                        )
+
+                    # Add the event to the chain.
+                    events.append(event)
+                elif isinstance(v, Callable):
+                    # Call the lambda to get the event chain.
+                    events.extend(utils.call_event_fn(v, arg))
+                else:
+                    raise ValueError(f"Invalid event: {v}")
 
         # If the input is a callable, create an event chain.
         elif isinstance(value, Callable):
@@ -160,7 +220,7 @@ class Component(Base, ABC):
             raise ValueError(f"Invalid event chain: {value}")
 
         # Add args to the event specs if necessary.
-        if event_trigger in self.get_controlled_triggers():
+        if is_controlled_event:
             events = [
                 EventSpec(
                     handler=e.handler,
@@ -180,25 +240,25 @@ class Component(Base, ABC):
         Returns:
             The event triggers.
         """
-        return EVENT_TRIGGERS | cls.get_controlled_triggers()
+        return EVENT_TRIGGERS | set(cls.get_controlled_triggers())
 
     @classmethod
-    def get_controlled_triggers(cls) -> Set[str]:
+    def get_controlled_triggers(cls) -> Dict[str, Var]:
         """Get the event triggers that pass the component's value to the handler.
 
         Returns:
-            The controlled event triggers.
+            A dict mapping the event trigger to the var that is passed to the handler.
         """
-        return set()
+        return {}
 
     @classmethod
-    def get_controlled_value(cls) -> Var:
-        """Get the var that is passed to the event handler for controlled triggers.
+    def get_alias(cls) -> Optional[str]:
+        """Get the alias for the component.
 
         Returns:
-            The controlled value.
+            The alias.
         """
-        return EVENT_ARG
+        return None
 
     def __repr__(self) -> str:
         """Represent the component in React.
@@ -223,14 +283,16 @@ class Component(Base, ABC):
             The tag to render.
         """
         # Create the base tag.
-        tag = Tag(name=self.tag)
+        alias = self.get_alias()
+        name = alias if alias is not None else self.tag
+        tag = Tag(name=name)
 
         # Add component props to the tag.
         props = {attr: getattr(self, attr) for attr in self.get_props()}
 
         # Special case for props named `type_`.
         if hasattr(self, "type_"):
-            props["type"] = getattr(self, "type_")
+            props["type"] = self.type_  # type: ignore
 
         return tag.add_props(**props)
 
@@ -241,7 +303,7 @@ class Component(Base, ABC):
         Returns:
             The unique fields.
         """
-        return set(cls.get_fields()) - set(Component.get_fields()) - {"library", "tag"}
+        return set(cls.get_fields()) - set(Component.get_fields())
 
     @classmethod
     def create(cls, *children, **props) -> Component:
@@ -262,17 +324,18 @@ class Component(Base, ABC):
 
         # Validate all the children.
         for child in children:
+            # Make sure the child is a valid type.
             if not utils._isinstance(child, ComponentChild):
                 raise TypeError(
                     "Children of Pynecone components must be other components, "
                     "state vars, or primitive Python types. "
-                    f"Got child of type {type(child)}.",
+                    f"Got child {child} of type {type(child)}.",
                 )
 
         children = [
-            Bare.create(contents=Var.create(child, is_string=True))
-            if not isinstance(child, Component)
-            else child
+            child
+            if isinstance(child, Component)
+            else Bare.create(contents=Var.create(child, is_string=True))
             for child in children
         ]
         return cls(children=children, **props)
@@ -293,7 +356,7 @@ class Component(Base, ABC):
             # Extract the style for this component.
             component_style = Style(style[type(self)])
 
-            # Only add stylee props that are not overriden.
+            # Only add style props that are not overridden.
             component_style = {
                 k: v for k, v in component_style.items() if k not in self.style
             }
@@ -314,10 +377,16 @@ class Component(Base, ABC):
         """
         tag = self._render()
         return str(
-            tag.add_props(**self.event_triggers, key=self.key, sx=self.style).set(
+            tag.add_props(
+                **self.event_triggers,
+                key=self.key,
+                sx=self.style,
+                id=self.id,
+                class_name=self.class_name,
+            ).set(
                 contents=utils.join(
                     [str(tag.contents)] + [child.render() for child in self.children]
-                ),
+                ).strip(),
             )
         )
 
@@ -352,7 +421,9 @@ class Component(Base, ABC):
 
     def _get_imports(self) -> ImportDict:
         if self.library is not None and self.tag is not None:
-            return {self.library: {self.tag}}
+            alias = self.get_alias()
+            tag = self.tag if alias is None else " as ".join([self.tag, alias])
+            return {self.library: {tag}}
         return {}
 
     def get_imports(self) -> ImportDict:
@@ -365,7 +436,176 @@ class Component(Base, ABC):
             self._get_imports(), *[child.get_imports() for child in self.children]
         )
 
+    def get_custom_components(
+        self, seen: Optional[Set[str]] = None
+    ) -> Set[CustomComponent]:
+        """Get all the custom components used by the component.
+
+        Args:
+            seen: The tags of the components that have already been seen.
+
+        Returns:
+            The set of custom components.
+        """
+        custom_components = set()
+
+        # Store the seen components in a set to avoid infinite recursion.
+        if seen is None:
+            seen = set()
+        for child in self.children:
+            custom_components |= child.get_custom_components(seen=seen)
+        return custom_components
+
 
 # Map from component to styling.
 ComponentStyle = Dict[Union[str, Type[Component]], Any]
 ComponentChild = Union[utils.PrimitiveType, Var, Component]
+
+
+class CustomComponent(Component):
+    """A custom user-defined component."""
+
+    # Use the components library.
+    library = f"/{constants.COMPONENTS_PATH}"
+
+    # The function that creates the component.
+    component_fn: Callable[..., Component]
+
+    # The props of the component.
+    props: Dict[str, Any] = {}
+
+    def __init__(self, *args, **kwargs):
+        """Initialize the custom component.
+
+        Args:
+            *args: The args to pass to the component.
+            **kwargs: The kwargs to pass to the component.
+        """
+        super().__init__(*args, **kwargs)
+
+        # Unset the style.
+        self.style = Style()
+
+        # Set the tag to the name of the function.
+        self.tag = utils.to_title_case(self.component_fn.__name__)
+
+        # Set the props.
+        props = typing.get_type_hints(self.component_fn)
+        for key, value in kwargs.items():
+            if key not in props:
+                continue
+            type_ = props[key]
+            if utils._issubclass(type_, EventChain):
+                value = self._create_event_chain(key, value)
+                self.props[utils.to_camel_case(key)] = value
+                continue
+            type_ = utils.get_args(type_)[0]
+            if utils._issubclass(type_, Base):
+                try:
+                    value = BaseVar(name=value.json(), type_=type_, is_local=True)
+                except Exception:
+                    value = Var.create(value)
+            else:
+                value = Var.create(value, is_string=type(value) is str)
+            self.props[utils.to_camel_case(key)] = value
+
+    def __eq__(self, other: Any) -> bool:
+        """Check if the component is equal to another.
+
+        Args:
+            other: The other component.
+
+        Returns:
+            Whether the component is equal to the other.
+        """
+        return isinstance(other, CustomComponent) and self.tag == other.tag
+
+    def __hash__(self) -> int:
+        """Get the hash of the component.
+
+        Returns:
+            The hash of the component.
+        """
+        return hash(self.tag)
+
+    @classmethod
+    def get_props(cls) -> Set[str]:
+        """Get the props for the component.
+
+        Returns:
+            The set of component props.
+        """
+        return set()
+
+    def get_custom_components(
+        self, seen: Optional[Set[str]] = None
+    ) -> Set[CustomComponent]:
+        """Get all the custom components used by the component.
+
+        Args:
+            seen: The tags of the components that have already been seen.
+
+        Returns:
+            The set of custom components.
+        """
+        assert self.tag is not None, "The tag must be set."
+
+        # Store the seen components in a set to avoid infinite recursion.
+        if seen is None:
+            seen = set()
+        custom_components = {self} | super().get_custom_components(seen=seen)
+
+        # Avoid adding the same component twice.
+        if self.tag not in seen:
+            seen.add(self.tag)
+            custom_components |= self.get_component().get_custom_components(seen=seen)
+        return custom_components
+
+    def _render(self) -> Tag:
+        """Define how to render the component in React.
+
+        Returns:
+            The tag to render.
+        """
+        return Tag(name=self.tag).add_props(**self.props)
+
+    def get_prop_vars(self) -> List[BaseVar]:
+        """Get the prop vars.
+
+        Returns:
+            The prop vars.
+        """
+        return [
+            BaseVar(
+                name=name,
+                type_=prop.type_ if utils._isinstance(prop, Var) else type(prop),
+            )
+            for name, prop in self.props.items()
+        ]
+
+    def get_component(self) -> Component:
+        """Render the component.
+
+        Returns:
+            The code to render the component.
+        """
+        return self.component_fn(*self.get_prop_vars())
+
+
+def custom_component(
+    component_fn: Callable[..., Component]
+) -> Callable[..., CustomComponent]:
+    """Create a custom component from a function.
+
+    Args:
+        component_fn: The function that creates the component.
+
+    Returns:
+        The decorated function.
+    """
+
+    @wraps(component_fn)
+    def wrapper(*children, **props) -> CustomComponent:
+        return CustomComponent(component_fn=component_fn, children=children, **props)
+
+    return wrapper

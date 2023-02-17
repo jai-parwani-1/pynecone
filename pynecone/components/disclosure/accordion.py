@@ -2,6 +2,7 @@
 
 from typing import List, Optional, Union
 
+from pynecone.components.component import Component
 from pynecone.components.libs.chakra import ChakraComponent
 from pynecone.var import Var
 
@@ -15,7 +16,7 @@ class Accordion(ChakraComponent):
     allow_multiple: Var[bool]
 
     # If true, any expanded accordion item can be collapsed again.
-    allow_toggle: Var[bool]
+    allow_toggle: Var[bool] = True  # type: ignore
 
     # The initial index(es) of the expanded accordion item(s).
     default_index: Var[Optional[List[int]]]
@@ -25,6 +26,39 @@ class Accordion(ChakraComponent):
 
     # If true, height animation and transitions will be disabled.
     reduce_motion: Var[bool]
+
+    @classmethod
+    def create(cls, *children, items=None, icon_pos="right", **props) -> Component:
+        """Create an accordion component.
+
+        Args:
+            children: The children of the component.
+            items: The items of the accordion component: list of tuples (label,panel)
+            icon_pos: The position of the arrow icon of the accordion. "right", "left" or None
+            props: The properties of the component.
+
+        Returns:
+            The accordion component
+        """
+        if len(children) == 0:
+            children = []
+            if not items:
+                items = []
+            for label, panel in items:
+                if icon_pos == "right":
+                    button = AccordionButton.create(label, AccordionIcon.create())
+                elif icon_pos == "left":
+                    button = AccordionButton.create(AccordionIcon.create(), label)
+                else:
+                    button = AccordionButton.create(label)
+
+                children.append(
+                    AccordionItem.create(
+                        button,
+                        AccordionPanel.create(panel),
+                    )
+                )
+        return super().create(*children, **props)
 
 
 class AccordionItem(ChakraComponent):

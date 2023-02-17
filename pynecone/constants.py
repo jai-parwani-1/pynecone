@@ -1,7 +1,9 @@
 """Constants used throughout the package."""
 
 import os
+import re
 from enum import Enum
+from types import SimpleNamespace
 
 import pkg_resources
 
@@ -9,9 +11,11 @@ import pkg_resources
 # The name of the Pynecone module.
 MODULE_NAME = "pynecone"
 # The name of the pip install package.
-PACKAGE_NAME = "pynecone-io"
+PACKAGE_NAME = "pynecone"
 # The current version of Pynecone.
 VERSION = pkg_resources.get_distribution(PACKAGE_NAME).version
+# Minimum version of Node.js required to run Pynecone.
+MIN_NODE_VERSION = "12.22.0"
 
 # Files and directories used to init a new project.
 # The root directory of the pynecone library.
@@ -35,33 +39,44 @@ WEB_DIR = ".web"
 # The name of the utils file.
 UTILS_DIR = "utils"
 # The name of the state file.
-STATE_PATH = os.path.join(UTILS_DIR, "state")
+STATE_PATH = "/".join([UTILS_DIR, "state"])
+# The name of the components file.
+COMPONENTS_PATH = "/".join([UTILS_DIR, "components"])
 # The directory where the app pages are compiled to.
 WEB_PAGES_DIR = os.path.join(WEB_DIR, "pages")
+# The directory where the static build is located.
+WEB_STATIC_DIR = os.path.join(WEB_DIR, "_static")
 # The directory where the utils file is located.
 WEB_UTILS_DIR = os.path.join(WEB_DIR, UTILS_DIR)
 # The directory where the assets are located.
 WEB_ASSETS_DIR = os.path.join(WEB_DIR, "public")
+# The sitemap config file.
+SITEMAP_CONFIG_FILE = os.path.join(WEB_DIR, "next-sitemap.config.js")
 # The node modules directory.
 NODE_MODULES = "node_modules"
 # The package lock file.
 PACKAGE_LOCK = "package-lock.json"
+# The pcversion template file.
+PCVERSION_TEMPLATE_FILE = os.path.join(WEB_TEMPLATE_DIR, "pynecone.json")
+# The pcversion app file.
+PCVERSION_APP_FILE = os.path.join(WEB_DIR, "pynecone.json")
+
 
 # Commands to run the app.
+# The frontend default port.
+FRONTEND_PORT = "3000"
 # The backend api url.
 API_URL = "http://localhost:8000"
 # The default path where bun is installed.
 BUN_PATH = "$HOME/.bun/bin/bun"
 # Command to install bun.
-INSTALL_BUN = "curl https://bun.sh/install | bash"
-# Command to run the backend in dev mode.
-RUN_BACKEND = "uvicorn --log-level critical --reload --host 0.0.0.0".split()
-# The number of workers to run in production mode by default.
-NUM_WORKERS = (os.cpu_count() or 1) * 2 + 1
+INSTALL_BUN = "curl -fsSL https://bun.sh/install | bash -s -- bun-v0.5.5"
+# Default host in dev mode.
+BACKEND_HOST = "0.0.0.0"
 # The default timeout when launching the gunicorn server.
 TIMEOUT = 120
 # The command to run the backend in production mode.
-RUN_BACKEND_PROD = f"gunicorn --worker-class uvicorn.workers.UvicornH11Worker --bind 0.0.0.0:8000 --workers {NUM_WORKERS} --threads {NUM_WORKERS} --preload --timeout {TIMEOUT} --log-level debug".split()
+RUN_BACKEND_PROD = f"gunicorn --worker-class uvicorn.workers.UvicornH11Worker --preload --timeout {TIMEOUT} --log-level critical".split()
 
 # Compiler variables.
 # The extension for compiled Javascript files.
@@ -74,6 +89,8 @@ APP_VAR = "app"
 API_VAR = "api"
 # The name of the router variable.
 ROUTER = "router"
+# The name of the socket variable.
+SOCKET = "socket"
 # The name of the variable to hold API results.
 RESULT = "result"
 # The name of the process variable.
@@ -108,6 +125,10 @@ DEFAULT_DESCRIPTION = "A Pynecone app."
 DEFAULT_IMAGE = "favicon.ico"
 
 
+# The gitignore file.
+GITIGNORE_FILE = ".gitignore"
+# Files to gitignore.
+DEFAULT_GITIGNORE = {WEB_DIR, DB_NAME}
 # The name of the pynecone config module.
 CONFIG_MODULE = "pcconfig"
 # The python config file.
@@ -124,6 +145,17 @@ class Env(str, Enum):
 
     DEV = "dev"
     PROD = "prod"
+
+
+# Log levels
+class LogLevel(str, Enum):
+    """The log levels."""
+
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
 
 
 class Endpoint(Enum):
@@ -146,7 +178,110 @@ class Endpoint(Enum):
         Returns:
             The full URL for the endpoint.
         """
+        # Import here to avoid circular imports.
         from pynecone import utils
 
+        # Get the API URL from the config.
         config = utils.get_config()
-        return "".join([config.api_url, str(self)])
+        url = "".join([config.api_url, str(self)])
+
+        # The event endpoint is a websocket.
+        if self == Endpoint.EVENT:
+            # Replace the protocol with ws.
+            url = url.replace("https://", "wss://").replace("http://", "ws://")
+
+        # Return the url.
+        return url
+
+
+class SocketEvent(Enum):
+    """Socket events sent by the pynecone backend API."""
+
+    PING = "ping"
+    EVENT = "event"
+
+    def __str__(self) -> str:
+        """Get the string representation of the event name.
+
+        Returns:
+            The event name string.
+        """
+        return str(self.value)
+
+
+class Transports(Enum):
+    """Socket transports used by the pynecone backend API."""
+
+    POLLING_WEBSOCKET = "['polling', 'websocket']"
+    WEBSOCKET_POLLING = "['websocket', 'polling']"
+    WEBSOCKET_ONLY = "['websocket']"
+    POLLING_ONLY = "['polling']"
+
+    def __str__(self) -> str:
+        """Get the string representation of the transports.
+
+        Returns:
+            The transports string.
+        """
+        return str(self.value)
+
+    def get_transports(self) -> str:
+        """Get the transports config for the backend.
+
+        Returns:
+            The transports config for the backend.
+        """
+        # Import here to avoid circular imports.
+        from pynecone import utils
+
+        # Get the transports from the config.
+        config = utils.get_config()
+        return str(config.backend_transports)
+
+
+class RouteArgType(SimpleNamespace):
+    """Type of dynamic route arg extracted from URI route."""
+
+    # Typecast to str is needed for Enum to work.
+    SINGLE = str("arg_single")
+    LIST = str("arg_list")
+
+
+class RouteVar(SimpleNamespace):
+    """Names of variables used in the router_data dict stored in State."""
+
+    CLIENT_IP = "ip"
+    CLIENT_TOKEN = "token"
+    HEADERS = "headers"
+    PATH = "pathname"
+    SESSION_ID = "sid"
+    QUERY = "query"
+
+
+class RouteRegex(SimpleNamespace):
+    """Regex used for extracting route args in route."""
+
+    ARG = re.compile(r"\[(?!\.)([^\[\]]+)\]")
+    # group return the catchall pattern (i.e. "[[..slug]]")
+    CATCHALL = re.compile(r"(\[?\[\.{3}(?![0-9]).*\]?\])")
+    # group return the arg name (i.e. "slug")
+    STRICT_CATCHALL = re.compile(r"\[\.{3}([a-zA-Z_][\w]*)\]")
+    # group return the arg name (i.e. "slug")
+    OPT_CATCHALL = re.compile(r"\[\[\.{3}([a-zA-Z_][\w]*)\]\]")
+
+
+# 404 variables
+ROOT_404 = ""
+SLUG_404 = "[..._]"
+TITLE_404 = "404 - Not Found"
+FAVICON_404 = "favicon.ico"
+DESCRIPTION_404 = "The page was not found"
+
+# Color mode variables
+USE_COLOR_MODE = "useColorMode"
+COLOR_MODE = "colorMode"
+TOGGLE_COLOR_MODE = "toggleColorMode"
+
+# Server socket configuration variables
+CORS_ALLOWED_ORIGINS = "*"
+POLLING_MAX_HTTP_BUFFER_SIZE = 1000 * 1000

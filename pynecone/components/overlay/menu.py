@@ -2,6 +2,7 @@
 
 from typing import Set
 
+from pynecone.components.component import Component
 from pynecone.components.libs.chakra import ChakraComponent
 from pynecone.var import Var
 
@@ -29,7 +30,7 @@ class Menu(ChakraComponent):
     # If by default the menu is open.
     default_is_open: Var[bool]
 
-    # If rtl, poper placement positions will be flipped i.e. 'top-right' will become 'top-left' and vice-verse ("ltr" | "rtl")
+    # If rtl, popper placement positions will be flipped i.e. 'top-right' will become 'top-left' and vice-verse ("ltr" | "rtl")
     direction: Var[str]
 
     # If true, the popper will change its placement and flip when it's about to overflow its boundary area.
@@ -68,6 +69,29 @@ class Menu(ChakraComponent):
         """
         return super().get_triggers() | {"on_close", "on_open"}
 
+    @classmethod
+    def create(cls, *children, button=None, items=None, **props) -> Component:
+        """Create a menu component.
+
+        Args:
+            children: The children of the component.
+            button: the button that open the menu.
+            items (list): The items of the menu.
+            props: The properties of the component.
+
+        Returns:
+            The menu component.
+        """
+        if len(children) == 0:
+            children = []
+
+            if button:
+                children.append(MenuButton.create(button))
+            if not items:
+                items = []
+            children.append(MenuList.create(*items))
+        return super().create(*children, **props)
+
 
 class MenuButton(ChakraComponent):
     """The trigger for the menu list. Must be a direct child of Menu."""
@@ -87,7 +111,7 @@ class MenuList(ChakraComponent):
     tag = "MenuList"
 
 
-class MenuItem(Menu):
+class MenuItem(ChakraComponent):
     """The trigger that handles menu selection. Must be a direct child of a MenuList."""
 
     tag = "MenuItem"
@@ -108,7 +132,7 @@ class MenuItem(Menu):
     is_focusable: Var[bool]
 
 
-class MenuItemOption(Menu):
+class MenuItemOption(ChakraComponent):
     """The checkable menu item, to be used with MenuOptionGroup."""
 
     tag = "MenuItemOption"
@@ -138,13 +162,13 @@ class MenuItemOption(Menu):
     value: Var[str]
 
 
-class MenuGroup(Menu):
+class MenuGroup(ChakraComponent):
     """A wrapper to group related menu items."""
 
     tag = "MenuGroup"
 
 
-class MenuOptionGroup(Menu):
+class MenuOptionGroup(ChakraComponent):
     """A wrapper for checkable menu items (radio and checkbox)."""
 
     tag = "MenuOptionGroup"
@@ -156,7 +180,7 @@ class MenuOptionGroup(Menu):
     value: Var[str]
 
 
-class MenuDivider(Menu):
+class MenuDivider(ChakraComponent):
     """A visual separator for menu items and groups."""
 
     tag = "MenuDivider"

@@ -78,7 +78,7 @@ class Tag(Base):
             return json.dumps(prop)
 
         elif isinstance(prop, Figure):
-            prop = json.loads(to_json(prop))["data"]
+            prop = json.loads(to_json(prop))["data"]  # type: ignore
 
         # For dictionaries, convert any properties to strings.
         else:
